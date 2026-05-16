@@ -533,9 +533,65 @@ function requireSetupAuth(req, res, next) {
   return next();
 }
 
+function requestOriginIsTrusted(req) {
+  const host = req.get("host");
+  if (!host) return false;
+  const scheme = req.get("x-forwarded-proto") || req.protocol || "http";
+  const expectedOrigin = `${scheme}://${host}`;
+
+  const origin = req.get("origin");
+  if (origin) {
+    return origin === expectedOrigin;
+  }
+
+  const referer = req.get("referer");
+  if (referer) {
+    try {
+      return new URL(referer).origin === expectedOrigin;
+    } catch {
+      return false;
+    }
+  }
+
+  const secFetchSite = req.get("sec-fetch-site");
+  if (secFetchSite && !["same-origin", "none"].includes(secFetchSite)) {
+    return false;
+  }
+
+  return true;
+}
+
+function requireTrustedSetupOrigin(req, res, next) {
+  if (!requestOriginIsTrusted(req)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Cross-origin setup request denied.",
+    });
+  }
+  return next();
+}
+
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader(
+    "Strict-Transport-Security",
+    "max-age=31536000; includeSubDomains",
+  );
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
+app.use("/setup/api", (req, res, next) => {
+  const method = req.method.toUpperCase();
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    return requireTrustedSetupOrigin(req, res, next);
+  }
+  return next();
+});
 
 app.get("/styles.css", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
@@ -2021,10 +2077,6 @@ app.use(async (req, res) => {
     }
   }
 
-  if (req.path === "/openclaw" && !req.query.token) {
-    return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
-  }
-
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -2066,6 +2118,11 @@ server.on("upgrade", async (req, socket, head) => {
 
     if (!verifyTuiAuth(req)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"OpenClaw TUI\"\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (!requestOriginIsTrusted(req)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
       return;
     }
